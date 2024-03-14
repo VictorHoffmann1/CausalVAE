@@ -1,0 +1,147 @@
+#Copyright (C) 2021. Huawei Technologies Co., Ltd. All rights reserved.
+#This program is free software; 
+#you can redistribute it and/or modify
+#it under the terms of the MIT License.
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the MIT License for more details.
+
+import torch
+from codebase import utils as ut
+import argparse
+from pprint import pprint
+cuda = torch.cuda.is_available()
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch import autograd
+from torch.autograd import Variable
+import numpy as np
+import math
+import time
+from torch.utils import data
+from utils import get_batch_unin_dataset_withlabel, _h_A
+
+import matplotlib.pyplot as plt
+import random
+import torch.utils.data as Data
+from PIL import Image
+import os
+import numpy as np
+from torchvision import transforms
+from codebase import utils as ut
+from codebase.models.mask_vae_flow import CausalVAE
+import argparse
+from pprint import pprint
+cuda = torch.cuda.is_available()
+from torchvision.utils import save_image
+
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--epoch_max',   type=int, default=101,    help="Number of training epochs")
+parser.add_argument('--iter_save',   type=int, default=5, help="Save model every n epochs")
+parser.add_argument('--toy',       type=str, default="flow_mask",     help="The toy dataset")
+parser.add_argument('--initial',       type=bool, default=True,     help="Initialize the dag matrix")
+
+args = parser.parse_args()
+device = torch.device("cuda:0" if(torch.cuda.is_available()) else "cpu")
+
+class DeterministicWarmup(object):
+	"""
+	Linear deterministic warm-up as described in
+	[S?nderby 2016].
+	"""
+	def __init__(self, n=100, t_max=1):
+		self.t = 0
+		self.t_max = t_max
+		self.inc = 1/n
+
+	def __iter__(self):
+		return self
+
+	def __next__(self):
+		t = self.t + self.inc
+
+		self.t = self.t_max if t > self.t_max else t
+		return self.t
+layout = [
+	('model={:s}',  'causalvae'),
+	('toy={:s}', str(args.toy))
+]
+
+model_name = '_'.join([t.format(v) for (t, v) in layout])
+pprint(vars(args))
+print('Model name:', model_name)
+lvae = CausalVAE(name=model_name, z_dim=16, initial=args.initial).to(device)
+if not os.path.exists('./figs_vae/'):
+	os.makedirs('./figs_vae/')
+
+dataset_dir = './causal_data/flow_noise'
+train_dataset = get_batch_unin_dataset_withlabel(dataset_dir, 64)
+test_dataset = get_batch_unin_dataset_withlabel(dataset_dir, 1)
+optimizer = torch.optim.Adam(lvae.parameters(), lr=1e-3, betas=(0.9, 0.999))
+beta = DeterministicWarmup(n=100, t_max=1) # Linear warm-up from 0 to 1 over 50 epoch
+
+def save_model_by_name(model):
+	save_dir = os.path.join('checkpoints', model.name)
+	if not os.path.exists(save_dir):
+		os.makedirs(save_dir)
+	file_path = os.path.join(save_dir, 'model.pt')
+	state = model.state_dict()
+	torch.save(state, file_path)
+	print('Saved to {}'.format(file_path))
+
+losses = []
+kls = []
+recs = []
+
+for epoch in range(args.epoch_max):
+    lvae.train()
+    total_loss = 0
+    total_rec = 0
+    total_kl = 0
+    for u, l in train_dataset:
+
+        optimizer.zero_grad()
+        u = u.to(device)
+        L, kl, rec, reconstructed_image,_ = lvae.negative_elbo_bound(u,l,sample = False)
+        
+        dag_param = lvae.dag.A
+        
+        h_a = _h_A(dag_param, dag_param.size()[0])
+        L = L + 3*h_a + 0.5*h_a*h_a 
+
+
+        L.backward()
+        optimizer.step()
+        total_loss += L.item()
+        total_kl += kl.item() 
+        total_rec += rec.item() 
+
+        m = len(train_dataset)
+        save_image(u[0], 'figs_vae/reconstructed_image_true_{}.png'.format(epoch), range = (0,1))
+        save_image(reconstructed_image[0], 'figs_vae/reconstructed_image_{}.png'.format(epoch), range = (0,1))
+        
+    avg_loss = total_loss/m
+    avg_kl = total_kl/m
+    avg_rec = total_rec/m
+
+    losses.append(avg_loss)
+    kls.append(avg_kl)
+    recs.append(avg_rec)
+
+    if epoch % 1 == 0:
+        print(str(epoch)+' loss:'+str(avg_loss)+' kl:'+str(avg_kl)+' rec:'+str(avg_rec)+'m:' + str(m))
+
+    if epoch % args.iter_save == 0:
+        save_model_by_name(lvae)
+
+# Plotting
+epochs = range(args.epoch_max)
+plt.figure(figsize=(12, 8))
+plt.plot(epochs, losses, label='Loss')
+plt.plot(epochs, kls, label='KL Divergence')
+plt.plot(epochs, recs, label='Reconstruct Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Value')
+plt.legend()
+plt.show()
